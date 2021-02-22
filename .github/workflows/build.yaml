@@ -1,0 +1,33 @@
+{
+  "env": {
+    "CLICOLOR": "1"
+  },
+  "jobs": {
+    "build": {
+      "runs-on": "ubuntu-latest",
+      "steps": [
+        {
+          "uses": "actions/checkout@v2"
+        },
+        {
+          "run": "sudo apt install libgtk-3-dev -y"
+        },
+        {
+          "run": "cargo build --release --verbose\nstrip target/release/gtk-input\n"
+        },
+        {
+          "uses": "actions/upload-artifact@v2",
+          "with": {
+            "path": "target/release/gtk-input"
+          }
+        }
+      ]
+    }
+  },
+  "name": "build",
+  "on": {
+    "push": {
+      "branches": "develop"
+    }
+  }
+}

@@ -1,0 +1,26 @@
+name = 'build'
+
+[on.push]
+branches = 'develop'
+
+[env]
+CLICOLOR = '1'
+
+[jobs.build]
+runs-on = 'ubuntu-latest'
+
+[[jobs.build.steps]]
+uses = 'actions/checkout@v2'
+
+[[jobs.build.steps]]
+run = 'sudo apt install libgtk-3-dev -y'
+
+[[jobs.build.steps]]
+run = '''
+cargo build --release --verbose
+strip target/release/gtk-input
+'''
+
+[[jobs.build.steps]]
+uses = 'actions/upload-artifact@v2'
+with = { path = 'target/release/gtk-input' }
