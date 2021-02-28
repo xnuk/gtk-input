@@ -1,6 +1,9 @@
 use std::ffi::CStr;
 use std::fs;
 use std::env;
+use std::boxed::Box;
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
 use gtk::prelude::*;
 use gtk::{
@@ -21,6 +24,15 @@ use gtk_sys::gtk_rc_get_im_module_file;
 
 const FALSE: i32 = 0;
 
+macro_rules! moved {
+	($x:expr, $($capture:ident)*) => {{
+		$(let $capture = $capture.to_owned();)*
+		$x
+	}};
+	($($capture:ident)*, $x:expr) => { moved!($x, $($capture)*) };
+	($x:expr) => {{ $x }};
+}
+
 fn format_key(key: &EventKey) -> String {
 	let code = key.get_hardware_keycode();
 	let modifiers = key.get_state();
@@ -32,7 +44,7 @@ fn format_key(key: &EventKey) -> String {
 				if modifiers.contains(ModifierType::$mask) {
 					shortcut.push_str($tok);
 				}
-			)*
+			)else*
 		}
 	}
 
@@ -90,24 +102,16 @@ fn current_im_module() -> Option<String> {
 		)
 }
 
-fn set_entry_im(input: &Entry, im: Option<String>) -> String {
+#[inline]
+fn set_entry_im(input: &Entry, im: Option<&str>) {
 	input.reset_im_context();
-
-	let im = im.unwrap_or_else(|| {
-		let a = input.get_text().to_string();
-		input.set_text("");
-		a
-	});
-
-	let trimmed = im.trim();
-
-	input.set_property_im_module(Some(trimmed));
-
-	trimmed.to_string()
+	input.set_property_im_module(im);
 }
 
 fn main() {
 	gtk::init().expect("Cannot init GTK.");
+
+	let ime_lock = Arc::new(Mutex::new(current_im_module()));
 
 	let entry = EntryBuilder::new()
 		.activates_default(true)
@@ -118,84 +122,134 @@ fn main() {
 		.hexpand(true)
 		.placeholder_text("IME name to switch")
 		.width_request(500)
-		.build()
-	;
+		.build();
+
+	let label = LabelBuilder::new()
+		.label("Type input method name and press enter will switch methods.")
+		.halign(Align::Start)
+		.build();
+
+	let listbox = ListBoxBuilder::new()
+		.selection_mode(SelectionMode::Single)
+		.build();
 
 	let dialog = DialogBuilder::new()
 		.decorated(false)
 		.use_header_bar(FALSE)
 		.resizable(false)
 		.skip_taskbar_hint(true)
-		.build()
-	;
+		.build();
 
-	let label = LabelBuilder::new()
-		.label("Type input method name and press enter will switch methods.")
-		.halign(Align::Start)
-		.build()
-	;
+	{
+		let content = dialog.get_content_area();
+		content.add(&label);
+		content.add(&entry);
+		content.add(&listbox);
+	}
 
-	let listbox = ListBoxBuilder::new()
-		.selection_mode(SelectionMode::Single)
-		.build()
-	;
+	listbox.set_sort_func(Some(Box::new(|a, b| {
+		let a = a.get_widget_name().to_string();
+		let b = b.get_widget_name().to_string();
+		a.cmp(&b) as i32
+	})));
 
-	let im = current_im_module()
-		.or_else(|| entry.get_property_im_module().map(|s| s.to_string()))
-		.unwrap_or_else(|| String::new());
+	listbox.set_filter_func(Some(Box::new(moved!(entry listbox, move |row| {
+		let text = entry.get_text().to_string();
+		let text = text.trim();
+		let name = row.get_widget_name().to_string();
 
-	let im_modules = list_im_modules();
+		let result = text.is_empty() || name.contains(text);
 
-	let rows: Vec<String> = im_modules.iter().enumerate().map(|(index, (id, description))| {
-		let row = ListBoxRowBuilder::new()
-			.child(
-				&Label::new(Some(
+		if row.get_activatable() != result {
+			row.set_activatable(result);
+		}
+
+		if row.get_selectable() != result {
+			if row.is_selected() && !result {
+				listbox.unselect_row(row);
+			}
+
+			row.set_selectable(result);
+		}
+
+		result
+	}))));
+
+	let im_modules = Arc::new({
+		let im_modules = list_im_modules();
+		let im = ime_lock.lock().unwrap().clone()
+			.or_else(|| entry.get_property_im_module().map(|s| s.to_string()))
+			.unwrap_or_default();
+
+		im_modules.iter().map(|(id, description)| {
+			let row = ListBoxRowBuilder::new()
+				.child(&Label::new(Some(
 					format!("{}: {}", id, description).as_str()
-				))
-			)
-			.selectable(true)
-			.build();
+				)))
+				.selectable(true)
+				.activatable(true)
+				.parent(&listbox)
+				.name(id)
+				.build();
 
-		listbox.insert(&row, index as i32);
+			if im == *id {
+				listbox.select_row(Some(&row));
+			}
 
-		if im == *id {
-			listbox.select_row(Some(&row));
-		}
-
-		id.clone()
-	}).collect();
-
-	let content = dialog.get_content_area();
-	content.add(&label);
-	content.add(&entry);
-	content.add(&listbox);
-
-
-	let rows_cloned = rows.clone();
-	let entry_cloned = entry.clone();
-
-	listbox.connect_row_selected(move |_, row| {
-		let im = row.and_then(|row| rows_cloned.get(row.get_index() as usize));
-		if let Some(im) = im {
-			set_entry_im(&entry_cloned, Some(im.clone()));
-		}
+			(id.clone(), row)
+		}).collect::<HashMap<String, _>>()
 	});
 
-	entry.connect_activate(move |input| {
-		let im = set_entry_im(&input, None);
+	moved!(ime_lock label, entry.connect_property_im_module_notify(move |input| {
+		let im = input.get_property_im_module()
+			.map(|s| s.to_string())
+			.unwrap_or_default();
 
-		if let Ok(index) = rows.binary_search(&im) {
-			if let Some(row) = listbox.get_row_at_index(index as i32) {
-				listbox.select_row(Some(&row))
+		label.set_text(format!("IME has been set to {}", im).as_str());
+
+		*ime_lock.lock().unwrap() = Some(im);
+	}));
+
+	moved!(entry, listbox.connect_row_activated(move |_, row| {
+		let im = row.get_widget_name().to_string().trim().to_string();
+
+		if let Some(ime) = ime_lock.lock().unwrap().clone() {
+			if ime == im {
+				return;
 			}
 		}
-	});
 
-	entry.connect_key_press_event(move |_, key| {
-		let a = format_key(&key);
-		label.set_text(a.as_str());
+		set_entry_im(
+			&entry,
+			Some(im.as_str()),
+		);
+
+		entry.grab_focus();
+	}));
+
+	moved!(listbox, entry.connect_activate(move |input| {
+		let im = input.get_text().to_string().trim().to_owned();
+
+		if let Some(row) = im_modules.get(&im) {
+			row.activate();
+		} else if let Some(row) = listbox.get_row_at_y(0) {
+			row.activate();
+		} else {
+			return
+		}
+
+		input.set_text("");
+	}));
+
+	moved!(label, entry.connect_key_press_event(move |_, key| {
+		label.set_text(format_key(&key).as_str());
+
 		Inhibit(false)
-	});
+	}));
+
+	moved!(listbox, entry.connect_property_text_notify(move |_| {
+		listbox.invalidate_filter();
+	}));
 
 	dialog.show_all();
 	dialog.run();
